@@ -1,0 +1,91 @@
+name: Carga
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 0' # domingo, 3h de Brasília: regressão de carga no pico real
+  workflow_dispatch:
+    inputs:
+      perfil:
+        description: 'Perfil da carga'
+        type: choice
+        options: [fumaca, degraus, regressao]
+        default: fumaca
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: carga-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  carga:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PERFIL: ${{ github.event_name == 'schedule' && 'regressao' || inputs.perfil || 'fumaca' }}
+      CARGA_LIBERADA: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'sim' || 'nao' }}
+      EXECUCAO: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Sobe o Rastreio Demo
+        run: |
+          node app/servidor.js > servidor.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:3333/saude && break; sleep 1; done
+
+      - uses: grafana/setup-k6-action@v1
+
+      - name: Roda os cenários
+        run: |
+          mkdir -p relatorios
+          falhou=0
+          for cenario in visitas pixel postbacks painel; do
+            echo "::group::$cenario ($PERFIL)"
+            k6 run carga/$cenario.js || falhou=1
+            echo "::endgroup::"
+          done
+          exit $falhou
+
+      - name: Índice dos relatórios
+        if: always()
+        run: |
+          {
+            echo '<!doctype html><meta charset="utf-8"><title>Relatórios de carga</title>'
+            echo '<style>body{font-family:system-ui;max-width:720px;margin:40px auto;padding:0 16px}a{display:block;margin:8px 0}</style>'
+            echo "<h1>Relatórios de carga</h1><p>Perfil: <b>$PERFIL</b> · execução ${{ github.run_id }} · $(date -u '+%d/%m/%Y %H:%M UTC')</p>"
+            for f in relatorios/*.html; do n=$(basename "$f"); echo "<a href=\"$n\">$n</a>"; done
+          } > relatorios/index.html
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: relatorios-${{ env.PERFIL }}
+          path: |
+            relatorios/
+            servidor.log
+
+      - uses: actions/upload-pages-artifact@v3
+        if: always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          path: relatorios
+
+  pages:
+    needs: carga
+    if: always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

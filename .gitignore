@@ -1,0 +1,4 @@
+relatorios/
+servidor.log
+node_modules/
+.env
